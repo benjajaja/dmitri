@@ -1,235 +1,26 @@
-use breadx::keysym_to_key;
-use breadx::Pixmap;
 use breadx::{
     auto::xproto::{InputFocus, SetInputFocusRequest, UngrabKeyRequest},
+    keysym_to_key,
     prelude::*,
-    DisplayConnection, Event, EventMask, Gcontext, Image, ImageFormat, KeyboardState, Window,
-    WindowClass,
+    DisplayConnection, Event, EventMask, KeyboardState, Window, WindowClass,
 };
-use font_loader::system_fonts;
 use getopts::Options;
 use gluten_keyboard::Key;
 use hex_color::HexColor;
 use rust_fuzzy_search::fuzzy_search_best_n;
-use rusttype::{point, Font, Scale, VMetrics};
-use std::env;
-use std::fs;
-use std::io::{self, Write};
-use std::os::unix::prelude::MetadataExt;
-use std::process::Command;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
-use std::{boxed::Box, error::Error, iter, process};
+use std::{
+    boxed::Box,
+    env,
+    error::Error,
+    fs,
+    io::{self, Write},
+    os::unix::prelude::MetadataExt,
+    process,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-struct RunOptions {
-    fontname: Option<String>,
-    fontsize: f32,
-    color: Color,
-    margin: u16,
-    precise_wheight: f32,
-}
-
-type Color = (u8, u8, u8);
-
-struct FontRender<'a> {
-    font: Font<'a>,
-    image: Image<Box<[u8]>>,
-    pixmap: Pixmap,
-    width: u16,
-    height: u16,
-    margin: u16,
-    scale: Scale,
-    color: Color,
-    color_secondary: Color,
-    v_metrics: VMetrics,
-}
-impl FontRender<'_> {
-    pub fn new<Dpy: Display + ?Sized>(
-        dpy: &mut Dpy,
-        window: Window,
-        depth: u8,
-        width: u32,
-        height: u32,
-        options: &RunOptions,
-    ) -> Result<FontRender<'static>, Box<dyn Error>> {
-        let image = Image::new(
-            &dpy,
-            Some(dpy.default_visual()),
-            depth,
-            ImageFormat::ZPixmap,
-            0,
-            create_heap_memory(width, height),
-            width as _,
-            height as _,
-            32,
-            None,
-        )
-        .ok_or("Could not create Image")?;
-
-        let pixmap = dpy.create_pixmap(window, width as _, height as _, depth)?;
-
-        let font = FontRender::font(&options.fontname)?;
-
-        let scale = Scale::uniform(options.fontsize);
-
-        let color = options.color;
-        let color_secondary = (color.0 / 2, color.1 / 2, color.2 / 2);
-
-        let v_metrics = font.v_metrics(scale);
-
-        return Ok(FontRender {
-            font,
-            image,
-            pixmap,
-            width: width as u16,
-            height: height as u16,
-            margin: options.margin,
-            scale,
-            color,
-            color_secondary,
-            v_metrics,
-        });
-    }
-
-    fn font(fontname: &Option<String>) -> Result<Font<'static>, Box<dyn Error>> {
-        let name = match fontname {
-            None => "monospace",
-            Some(name) => name,
-        };
-
-        let property = system_fonts::FontPropertyBuilder::new()
-            .monospace()
-            .family(name)
-            .family("ProFontWindows")
-            .build();
-        let (font_data, _) =
-            system_fonts::get(&property).ok_or("Could not get system fonts property")?;
-
-        let font: Font<'static> = Font::try_from_vec(font_data).expect("Error constructing Font");
-        return Ok(font);
-    }
-
-    pub fn render_text<Dpy: Display + ?Sized>(
-        self: &mut Self,
-        dpy: &mut Dpy,
-        window: Window,
-        gc: Gcontext,
-        input: &String,
-        matches: &Vec<String>,
-        matches_i: Option<usize>,
-    ) -> Result<(), Box<dyn Error>> {
-        // turn off checked mode to speed up painting
-        dpy.set_checked(false);
-
-        // clear image
-        for x in 0..self.width {
-            for y in 0..self.height {
-                self.image.set_pixel(x as _, y as _, 0);
-            }
-        }
-
-        if input.len() == 0 {
-            self.render_glyphs(0, &"_".to_string(), self.color);
-        } else {
-            let mut x: u32 = 0;
-            let color = if matches_i.is_none() {
-                self.color
-            } else {
-                self.color_secondary
-            };
-            x = self.render_glyphs(x, input, color);
-
-            for (i, m) in matches.iter().enumerate() {
-                x = self.render_glyphs(x, " ", self.color_secondary);
-                let color = if let Some(m_i) = matches_i {
-                    if m_i == i {
-                        self.color
-                    } else {
-                        self.color_secondary
-                    }
-                } else {
-                    self.color_secondary
-                };
-                x = self.render_glyphs(x, &m, color);
-                if x > self.width as _ {
-                    break;
-                }
-            }
-            // }
-        }
-
-        dpy.put_image(
-            self.pixmap,
-            gc,
-            &self.image,
-            0,
-            0,
-            0,
-            0,
-            self.width as _,
-            self.height as _,
-        )?;
-        dpy.copy_area(
-            self.pixmap,
-            window,
-            gc,
-            0,
-            0,
-            self.width as _,
-            self.height as _,
-            0,
-            0,
-        )?;
-
-        dpy.set_checked(true);
-        return Ok(());
-    }
-
-    fn render_glyphs(self: &mut Self, offset: u32, text: &str, color: Color) -> u32 {
-        let glyphs: Vec<_> = self
-            .font
-            .layout(
-                &(text.to_string() + " "),
-                self.scale,
-                point(0.0, 0.0 + self.v_metrics.ascent),
-            )
-            .collect();
-
-        let mut next_x = offset;
-        for glyph in glyphs {
-            if let Some(bounding_box) = glyph.pixel_bounding_box() {
-                let mut outside = false;
-                // Draw the glyph into the image per-pixel by using the draw closure
-                glyph.draw(|x, y, v| {
-                    let x = self.margin as usize
-                        + offset as usize
-                        + (x as i32 + bounding_box.min.x) as usize;
-                    let y = self.margin as usize + (y as i32 + bounding_box.min.y) as usize;
-                    if x < (self.width - self.margin * 2) as usize {
-                        self.image.set_pixel(
-                            x,
-                            y,
-                            rgb(
-                                (color.0 as f32 * v) as u8,
-                                (color.1 as f32 * v) as u8,
-                                (color.2 as f32 * v) as u8,
-                            ),
-                        );
-                        next_x = offset + bounding_box.max.x as u32;
-                    } else {
-                        outside = true;
-                    }
-                });
-                if outside {
-                    break;
-                }
-            } else {
-                next_x = offset + glyph.position().x as u32;
-            }
-        }
-        next_x
-    }
-}
+mod text;
+use text::{FontRenderer, RunOptions};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -255,7 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     if matches.opt_present("h") {
-        println!("Usage: {} [-f <font name>]", program);
+        println!("Usage: {} [-f <font name> -s <font size> -m <margin> -c <hex color> -p <precise wheight>]", program);
         return Ok(());
     }
     let options = RunOptions {
@@ -295,7 +86,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         None,                        // depth (none means inherit from parent)
         None,                        // visual (none means "       "    "    )
         0,                           // x
-        // (root_geometry.height - height) as i16, // y
         0,
         root_geometry.width, // width
         height as _,         // height
@@ -303,7 +93,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         params,              // additional properties
     )?;
 
-    // map the window (e.g. display it) and set its title
     window.set_event_mask(
         &mut conn,
         EventMask::EXPOSURE
@@ -320,14 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     })?;
 
-    // set up a graphics context for our window
-    let mut gc_parameters: GcParameters = Default::default();
-    gc_parameters.foreground = Some(conn.default_black_pixel());
-    gc_parameters.graphics_exposures = Some(0);
-    gc_parameters.line_width = Some(10);
-    let gc = conn.create_gc(window, gc_parameters)?;
-
-    match run(&mut conn, window, root, gc, options) {
+    match run(&mut conn, window, root, options) {
         Err(err) => {
             eprintln!("Error: {}", err);
             Err(err)
@@ -335,7 +117,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         Ok(output) => {
             if output.len() > 0 {
                 println!("{}", output);
-                Command::new(output).spawn()?;
+                process::Command::new(output).spawn()?;
             }
             Ok(())
         }
@@ -346,9 +128,10 @@ fn run<Dpy: Display + ?Sized>(
     conn: &mut Dpy,
     window: Window,
     root: Window,
-    gc: Gcontext,
     options: RunOptions,
 ) -> Result<String, Box<dyn Error>> {
+    let gc = conn.create_gc(window, Default::default())?;
+
     // set up the exit protocol, this ensures the window exits when the "X"
     // button is clicked
     let wm_delete_window = conn.intern_atom_immediate("WM_DELETE_WINDOW".to_owned(), false)?;
@@ -364,7 +147,7 @@ fn run<Dpy: Display + ?Sized>(
     let mut matches_i: Option<usize> = None;
 
     let geometry = window.geometry_immediate(conn)?;
-    let mut font_render = FontRender::new(
+    let mut font_render = FontRenderer::new(
         conn,
         window,
         geometry.depth,
@@ -376,7 +159,6 @@ fn run<Dpy: Display + ?Sized>(
     loop {
         let ev = match conn.wait_for_event() {
             Ok(ev) => ev,
-            // Err(ClosedConnection) => break,
             Err(e) => {
                 eprintln!("Program closed with error: {:?}", e);
                 process::exit(1);
@@ -475,19 +257,10 @@ fn run<Dpy: Display + ?Sized>(
                     }
                     font_render.render_text(conn, window, gc, &input, &matches, matches_i)?;
                 }
-                io::stdout().flush()?;
             }
             _ => (),
         }
     }
-}
-
-// Helper function to create a chunk of zeroed heap memory for an image.
-#[inline]
-fn create_heap_memory(width: u32, height: u32) -> Box<[u8]> {
-    iter::repeat(0)
-        .take((width * height) as usize * 4)
-        .collect()
 }
 
 fn build_path() -> Result<Vec<String>, Box<dyn Error>> {
