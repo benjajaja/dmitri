@@ -9,6 +9,7 @@ use breadx::{
 use font_loader::system_fonts;
 use getopts::Options;
 use gluten_keyboard::Key;
+use hex_color::HexColor;
 use rust_fuzzy_search::fuzzy_search_best_n;
 use rusttype::{point, Font, Scale, VMetrics};
 use std::env;
@@ -23,11 +24,12 @@ use std::{boxed::Box, error::Error, iter, process};
 struct RunOptions {
     fontname: Option<String>,
     fontsize: f32,
+    color: Color,
     margin: u16,
     precise_wheight: f32,
 }
 
-type Color = (i32, i32, i32);
+type Color = (u8, u8, u8);
 
 struct FontRender<'a> {
     font: Font<'a>,
@@ -70,8 +72,8 @@ impl FontRender<'_> {
 
         let scale = Scale::uniform(options.fontsize);
 
-        let color = (0, 200, 50);
-        let color_secondary = (0, 100, 25);
+        let color = options.color;
+        let color_secondary = (color.0 / 2, color.1 / 2, color.2 / 2);
 
         let v_metrics = font.v_metrics(scale);
 
@@ -237,6 +239,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     opts.optopt("f", "fontname", "set font name", "mono");
     opts.optopt("s", "fontsize", "set font size", "32");
     opts.optopt("m", "margin", "set margin", "7");
+    opts.optopt("c", "color", "set color", "#ff8800");
     opts.optopt(
         "p",
         "precise-wheight",
@@ -261,6 +264,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             .opt_str("s")
             .and_then(|s| s.parse::<f32>().ok())
             .unwrap_or(32.0),
+        color: matches
+            .opt_str("c")
+            .and_then(|s| s.parse::<HexColor>().ok())
+            .map(|h| (h.r, h.g, h.b))
+            .unwrap_or((255, 127, 0)),
         margin: matches
             .opt_str("m")
             .and_then(|s| s.parse::<u16>().ok())
