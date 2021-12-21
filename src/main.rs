@@ -9,14 +9,23 @@ use breadx::{
 use font_loader::system_fonts;
 use getopts::Options;
 use gluten_keyboard::Key;
-use rs_complete::CompletionTree;
+use rust_fuzzy_search::fuzzy_search_best_n;
 use rusttype::{point, Font, Scale, VMetrics};
 use std::env;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::prelude::MetadataExt;
 use std::process::Command;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use std::{boxed::Box, error::Error, iter, process};
+
+struct RunOptions {
+    fontname: Option<String>,
+    fontsize: f32,
+    margin: u16,
+    precise_wheight: f32,
+}
 
 type Color = (i32, i32, i32);
 
@@ -26,6 +35,7 @@ struct FontRender<'a> {
     pixmap: Pixmap,
     width: u16,
     height: u16,
+    margin: u16,
     scale: Scale,
     color: Color,
     color_secondary: Color,
@@ -38,7 +48,7 @@ impl FontRender<'_> {
         depth: u8,
         width: u32,
         height: u32,
-        fontname: Option<String>,
+        options: &RunOptions,
     ) -> Result<FontRender<'static>, Box<dyn Error>> {
         let image = Image::new(
             &dpy,
@@ -56,9 +66,9 @@ impl FontRender<'_> {
 
         let pixmap = dpy.create_pixmap(window, width as _, height as _, depth)?;
 
-        let font = FontRender::font(fontname)?;
+        let font = FontRender::font(&options.fontname)?;
 
-        let scale = Scale::uniform(32.0);
+        let scale = Scale::uniform(options.fontsize);
 
         let color = (0, 200, 50);
         let color_secondary = (0, 100, 25);
@@ -71,6 +81,7 @@ impl FontRender<'_> {
             pixmap,
             width: width as u16,
             height: height as u16,
+            margin: options.margin,
             scale,
             color,
             color_secondary,
@@ -78,8 +89,11 @@ impl FontRender<'_> {
         });
     }
 
-    fn font(fontname: Option<String>) -> Result<Font<'static>, Box<dyn Error>> {
-        let name: &str = &fontname.unwrap_or("monospace".to_string());
+    fn font(fontname: &Option<String>) -> Result<Font<'static>, Box<dyn Error>> {
+        let name = match fontname {
+            None => "monospace",
+            Some(name) => name,
+        };
 
         let property = system_fonts::FontPropertyBuilder::new()
             .monospace()
@@ -116,30 +130,30 @@ impl FontRender<'_> {
             self.render_glyphs(0, &"_".to_string(), self.color);
         } else {
             let mut x: u32 = 0;
-            x = self.render_glyphs(x, input, self.color);
-            if let Some(first) = matches.first() {
-                if first.len() > input.len() {
-                    let tail = String::from(&first[input.len()..]);
-                    x = self.render_glyphs(x, &tail, self.color_secondary);
-                }
+            let color = if matches_i.is_none() {
+                self.color
+            } else {
+                self.color_secondary
+            };
+            x = self.render_glyphs(x, input, color);
 
-                for (i, m) in matches[1..].iter().enumerate() {
-                    x = self.render_glyphs(x, " ", self.color_secondary);
-                    let color = if let Some(m_i) = matches_i {
-                        if m_i - 1 == i {
-                            self.color
-                        } else {
-                            self.color_secondary
-                        }
+            for (i, m) in matches.iter().enumerate() {
+                x = self.render_glyphs(x, " ", self.color_secondary);
+                let color = if let Some(m_i) = matches_i {
+                    if m_i == i {
+                        self.color
                     } else {
                         self.color_secondary
-                    };
-                    x = self.render_glyphs(x, &m, color);
-                    if x > self.width as _ {
-                        break;
                     }
+                } else {
+                    self.color_secondary
+                };
+                x = self.render_glyphs(x, &m, color);
+                if x > self.width as _ {
+                    break;
                 }
             }
+            // }
         }
 
         dpy.put_image(
@@ -185,9 +199,11 @@ impl FontRender<'_> {
                 let mut outside = false;
                 // Draw the glyph into the image per-pixel by using the draw closure
                 glyph.draw(|x, y, v| {
-                    let x = offset as usize + (x as i32 + bounding_box.min.x) as usize;
-                    let y = (y as i32 + bounding_box.min.y) as usize;
-                    if x < self.width as _ {
+                    let x = self.margin as usize
+                        + offset as usize
+                        + (x as i32 + bounding_box.min.x) as usize;
+                    let y = self.margin as usize + (y as i32 + bounding_box.min.y) as usize;
+                    if x < (self.width - self.margin * 2) as usize {
                         self.image.set_pixel(
                             x,
                             y,
@@ -218,7 +234,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     let program = args[0].clone();
 
     let mut opts = Options::new();
-    opts.optopt("f", "", "set font name", "mono");
+    opts.optopt("f", "fontname", "set font name", "mono");
+    opts.optopt("s", "fontsize", "set font size", "32");
+    opts.optopt("m", "margin", "set margin", "7");
+    opts.optopt(
+        "p",
+        "precise-wheight",
+        "set additional wheight of subtext matching",
+        "5.0",
+    );
 
     opts.optflag("h", "help", "print this help menu");
     let matches = match opts.parse(&args[1..]) {
@@ -231,6 +255,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Usage: {} [-f <font name>]", program);
         return Ok(());
     }
+    let options = RunOptions {
+        fontname: matches.opt_str("f"),
+        fontsize: matches
+            .opt_str("s")
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(32.0),
+        margin: matches
+            .opt_str("m")
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(7),
+        precise_wheight: matches
+            .opt_str("p")
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(5.0),
+    };
 
     let mut conn = DisplayConnection::create(None, None)?;
 
@@ -241,7 +280,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     params.background_pixel = Some(conn.default_black_pixel());
     params.override_redirect = Some(1);
 
-    let height = 32;
+    let height = options.fontsize + (options.margin * 2) as f32;
     let window = conn.create_window(
         root,                        // parent
         WindowClass::CopyFromParent, // window class
@@ -251,7 +290,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // (root_geometry.height - height) as i16, // y
         0,
         root_geometry.width, // width
-        height,              // height
+        height as _,         // height
         0,                   // border width
         params,              // additional properties
     )?;
@@ -280,8 +319,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     gc_parameters.line_width = Some(10);
     let gc = conn.create_gc(window, gc_parameters)?;
 
-    let fontname = matches.opt_str("f");
-    match run(&mut conn, window, root, gc, fontname) {
+    match run(&mut conn, window, root, gc, options) {
         Err(err) => {
             eprintln!("Error: {}", err);
             Err(err)
@@ -301,7 +339,7 @@ fn run<Dpy: Display + ?Sized>(
     window: Window,
     root: Window,
     gc: Gcontext,
-    fontname: Option<String>,
+    options: RunOptions,
 ) -> Result<String, Box<dyn Error>> {
     // set up the exit protocol, this ensures the window exits when the "X"
     // button is clicked
@@ -312,7 +350,7 @@ fn run<Dpy: Display + ?Sized>(
 
     let mut input = "".to_string();
 
-    let completions = build_path()?;
+    let executables = build_path()?;
 
     let mut matches: Vec<String> = vec![];
     let mut matches_i: Option<usize> = None;
@@ -324,7 +362,7 @@ fn run<Dpy: Display + ?Sized>(
         geometry.depth,
         geometry.width as _,
         geometry.height as _,
-        fontname,
+        &options,
     )?;
 
     loop {
@@ -374,7 +412,7 @@ fn run<Dpy: Display + ?Sized>(
                         }
                         Key::Enter => {
                             let output: String = match matches_i {
-                                None => matches.first().map(String::to_owned).unwrap_or(input),
+                                None => input,
                                 Some(i) => matches.get(i).map(String::to_owned).unwrap_or(input),
                             };
                             return Ok(output);
@@ -384,7 +422,7 @@ fn run<Dpy: Display + ?Sized>(
                                 match matches_i {
                                     None => {
                                         if !kp.state.shift() {
-                                            matches_i = Some(1);
+                                            matches_i = Some(0);
                                         } else {
                                             matches_i = Some(matches.len() - 1);
                                         }
@@ -396,7 +434,7 @@ fn run<Dpy: Display + ?Sized>(
                                                 None => matches_i = None,
                                             }
                                         } else {
-                                            if i > 1 && matches.get(i - 1).is_some() {
+                                            if i > 0 && matches.get(i - 1).is_some() {
                                                 matches_i = Some(i - 1);
                                             } else {
                                                 matches_i = None;
@@ -410,7 +448,7 @@ fn run<Dpy: Display + ?Sized>(
                             if input.len() > 0 {
                                 input = input[0..input.len() - 1].to_string();
                                 matches_i = None;
-                                matches = search(&input, &completions);
+                                matches = search(&input, &executables, options.precise_wheight);
                             }
                         }
                         _ => {
@@ -423,7 +461,7 @@ fn run<Dpy: Display + ?Sized>(
                                 }
                                 input.push(keycode_char);
                                 matches_i = None;
-                                matches = search(&input, &completions);
+                                matches = search(&input, &executables, options.precise_wheight);
                             }
                         }
                     }
@@ -444,8 +482,7 @@ fn create_heap_memory(width: u32, height: u32) -> Box<[u8]> {
         .collect()
 }
 
-fn build_path() -> Result<CompletionTree, Box<dyn Error>> {
-    let mut completions = CompletionTree::with_inclusions(&['-', '_', '.']);
+fn build_path() -> Result<Vec<String>, Box<dyn Error>> {
     let mut executables: Vec<String> = vec![];
 
     let path_var = env::var("PATH")?;
@@ -458,33 +495,47 @@ fn build_path() -> Result<CompletionTree, Box<dyn Error>> {
                 let os_filename = entry.file_name();
                 let filename = os_filename.to_string_lossy().to_string();
                 if executables.contains(&filename) {
-                    // eprintln!("dupe: {}", filename);
                     break;
                 }
                 let pathbuf = entry.path();
                 let metadata = fs::metadata(&pathbuf)?;
                 let mode = metadata.mode();
                 if metadata.is_file() && mode & 0o111 != 0 {
-                    if path.eq("/usr/bin") {
-                        println!("entry: {:?} {}", entry, filename);
-                    }
-                    completions.insert(&filename);
                     executables.push(filename);
-                } else {
-                    eprintln!("not file / executable: {:?}", path);
                 }
             }
-        } else {
-            eprintln!("Cannot read dir: {}", path);
         }
     }
     executables.sort();
-    Ok(completions)
+    Ok(executables)
 }
 
-fn search(input: &String, completions: &CompletionTree) -> Vec<String> {
+fn search(input: &String, executables: &Vec<String>, precise_wheight: f32) -> Vec<String> {
     if input.len() == 0 {
         return vec![];
     }
-    return completions.complete(input).unwrap_or(vec![]);
+
+    let list = executables
+        .iter()
+        .map(String::as_ref)
+        .collect::<Vec<&str>>();
+
+    let mut res: Vec<(&str, f32)> = fuzzy_search_best_n(input, &list, 20);
+    for i in 0..res.len() {
+        if let Some(start) = res[i].0.find(input) {
+            res[i].1 += (precise_wheight / (start as f32 + precise_wheight)) as f32;
+        }
+    }
+    res.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    return res.iter().map(|(s, _)| String::from(*s)).collect();
+}
+
+#[allow(dead_code)]
+fn pt() {
+    let start = SystemTime::now();
+    let since_the_epoch = start
+        .duration_since(UNIX_EPOCH)
+        .expect("Time went backwards");
+    println!("{:?}", since_the_epoch);
 }
