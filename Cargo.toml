@@ -1,6 +1,6 @@
 [package]
 name = "dmitri"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license-file = "LICENSE.txt"
 keywords = ["launcher", "dmenu"]
@@ -11,7 +11,7 @@ repository = "https://github.com/gipsy-king/dmitri"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-breadx = "2.0.0"
+breadx = "3.1.0"
 gluten-keyboard = "0.1.2"
 rusttype = "0.9.2"
 font-loader = "0.11.0"
