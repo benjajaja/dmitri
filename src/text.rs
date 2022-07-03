@@ -86,7 +86,7 @@ impl FontRenderer<'_> {
         let property = system_fonts::FontPropertyBuilder::new()
             .monospace()
             .family(name)
-            .family("ProFontWindows")
+            .family("ProFontWindows Nerd Font Mono")
             .build();
         let (font_data, _) =
             system_fonts::get(&property).ok_or("Could not get system fonts property")?;
@@ -184,13 +184,13 @@ impl FontRenderer<'_> {
             if let Some(bounding_box) = glyph.pixel_bounding_box() {
                 let mut outside = false;
                 glyph.draw(|x, y, v| {
-                    let x = self.margin as usize
-                        + offset as usize
-                        + (x as i32 + bounding_box.min.x) as usize;
+                    let x = self.margin as i32
+                        + offset as i32
+                        + (x as i32 + bounding_box.min.x) as i32;
                     let y = self.margin as usize + (y as i32 + bounding_box.min.y) as usize;
-                    if x < (self.width - self.margin * 2) as usize {
+                    if x < (self.width - self.margin * 2) as i32 {
                         self.image.set_pixel(
-                            x,
+                            x as usize,
                             y,
                             rgb(
                                 (color.0 as f32 * v) as u8,
