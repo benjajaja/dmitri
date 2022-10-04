@@ -63,7 +63,7 @@ impl FontRenderer<'_> {
 
         let v_metrics = font.v_metrics(scale);
 
-        return Ok(FontRenderer {
+        Ok(FontRenderer {
             font,
             image,
             pixmap,
@@ -74,7 +74,7 @@ impl FontRenderer<'_> {
             color,
             color_secondary,
             v_metrics,
-        });
+        })
     }
 
     fn font(fontname: &Option<String>) -> Result<Font<'static>, Box<dyn Error>> {
@@ -92,16 +92,16 @@ impl FontRenderer<'_> {
             system_fonts::get(&property).ok_or("Could not get system fonts property")?;
 
         let font: Font<'static> = Font::try_from_vec(font_data).expect("Error constructing Font");
-        return Ok(font);
+        Ok(font)
     }
 
     pub fn render_text<Dpy: Display + ?Sized>(
-        self: &mut Self,
+        &mut self,
         dpy: &mut Dpy,
         window: Window,
         gc: Gcontext,
-        input: &String,
-        matches: &Vec<String>,
+        input: &str,
+        matches: &[String],
         matches_i: Option<usize>,
     ) -> Result<(), Box<dyn Error>> {
         // turn off checked mode to speed up painting
@@ -112,8 +112,8 @@ impl FontRenderer<'_> {
             self.image.data[i] = 0;
         }
 
-        if input.len() == 0 {
-            self.render_glyphs(0, &"_".to_string(), self.color);
+        if input.is_empty() {
+            self.render_glyphs(0, "_", self.color);
         } else {
             let mut x: u32 = 0;
             let color = if matches_i.is_none() {
@@ -134,7 +134,7 @@ impl FontRenderer<'_> {
                 } else {
                     self.color_secondary
                 };
-                x = self.render_glyphs(x, &m, color);
+                x = self.render_glyphs(x, m, color);
                 if x > self.width as _ {
                     break;
                 }
@@ -166,10 +166,10 @@ impl FontRenderer<'_> {
         )?;
 
         dpy.set_checked(true);
-        return Ok(());
+        Ok(())
     }
 
-    fn render_glyphs(self: &mut Self, offset: u32, text: &str, color: Color) -> u32 {
+    fn render_glyphs(&mut self, offset: u32, text: &str, color: Color) -> u32 {
         let glyphs: Vec<_> = self
             .font
             .layout(
@@ -184,9 +184,8 @@ impl FontRenderer<'_> {
             if let Some(bounding_box) = glyph.pixel_bounding_box() {
                 let mut outside = false;
                 glyph.draw(|x, y, v| {
-                    let x = self.margin as i32
-                        + offset as i32
-                        + (x as i32 + bounding_box.min.x) as i32;
+                    let x =
+                        self.margin as i32 + offset as i32 + (x as i32 + bounding_box.min.x) as i32;
                     let y = self.margin as usize + (y as i32 + bounding_box.min.y) as usize;
                     if x < (self.width - self.margin * 2) as i32 {
                         self.image.set_pixel(

@@ -8,24 +8,12 @@ use getopts::Options;
 use gluten_keyboard::Key;
 use hex_color::HexColor;
 use rust_fuzzy_search::fuzzy_search_best_n;
-use std::{
-    boxed::Box,
-    env,
-    error::Error,
-    fs,
-    io::{self, Write},
-    os::unix::prelude::MetadataExt,
-    process,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{boxed::Box, env, error::Error, fs, os::unix::prelude::MetadataExt, process};
 
 mod text;
 use text::{FontRenderer, RunOptions};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    let program = args[0].clone();
-
     let mut opts = Options::new();
     opts.optopt("f", "fontname", "set font name", "mono");
     opts.optopt("s", "fontsize", "set font size", "32");
@@ -39,14 +27,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     opts.optflag("h", "help", "print this help menu");
+
+    let args: Vec<String> = std::env::args().collect();
     let matches = match opts.parse(&args[1..]) {
         Ok(m) => m,
-        Err(f) => {
-            panic!("{}", f);
-        }
+        Err(f) => panic!("Could not parse arguments: {}", f),
     };
     if matches.opt_present("h") {
-        println!("Usage: {} [-f <font name> -s <font size> -m <margin> -c <hex color> -p <precise wheight>]", program);
+        println!("{}", opts.usage("dmitri: a launcher"));
         return Ok(());
     }
     let options = RunOptions {
@@ -75,9 +63,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let root = conn.default_screen().root;
     let root_geometry = root.geometry_immediate(&mut conn)?;
 
-    let mut params: WindowParameters = Default::default();
-    params.background_pixel = Some(conn.default_black_pixel());
-    params.override_redirect = Some(1);
+    let params: WindowParameters = WindowParameters {
+        background_pixel: Some(conn.default_black_pixel()),
+        override_redirect: Some(1),
+        ..Default::default()
+    };
 
     let height = options.fontsize + (options.margin * 2) as f32;
     let window = conn.create_window(
@@ -115,9 +105,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(err)
         }
         Ok(output) => {
-            if output.len() > 0 {
-                println!("{}", output);
-                process::Command::new(output).spawn()?;
+            if !output.is_empty() {
+                return spawn(output);
             }
             Ok(())
         }
@@ -139,9 +128,7 @@ fn run<Dpy: Display + ?Sized>(
 
     let keystate = KeyboardState::new(conn)?;
 
-    let mut input = "".to_string();
-
-    let executables = build_path()?;
+    let mut input = String::new();
 
     let mut matches: Vec<String> = vec![];
     let mut matches_i: Option<usize> = None;
@@ -155,6 +142,8 @@ fn run<Dpy: Display + ?Sized>(
         geometry.height as _,
         &options,
     )?;
+
+    let executables = build_path()?;
 
     loop {
         let ev = match conn.wait_for_event() {
@@ -175,7 +164,6 @@ fn run<Dpy: Display + ?Sized>(
                 font_render.render_text(conn, window, gc, &input, &matches, matches_i)?;
             }
             Event::FocusOut(_e) => {
-                // println!("Leave: {:?}", e);
                 conn.send_request(SetInputFocusRequest {
                     focus: window,
                     revert_to: InputFocus::Parent,
@@ -223,19 +211,17 @@ fn run<Dpy: Display + ?Sized>(
                                                 Some(_) => matches_i = Some(i + 1),
                                                 None => matches_i = None,
                                             }
+                                        } else if i > 0 && matches.get(i - 1).is_some() {
+                                            matches_i = Some(i - 1);
                                         } else {
-                                            if i > 0 && matches.get(i - 1).is_some() {
-                                                matches_i = Some(i - 1);
-                                            } else {
-                                                matches_i = None;
-                                            }
+                                            matches_i = None;
                                         }
                                     }
                                 }
                             }
                         }
                         Key::Backspace => {
-                            if input.len() > 0 {
+                            if !input.is_empty() {
                                 input = input[0..input.len() - 1].to_string();
                                 matches_i = None;
                                 matches = search(&input, &executables, options.precise_wheight);
@@ -267,7 +253,7 @@ fn build_path() -> Result<Vec<String>, Box<dyn Error>> {
     let mut executables: Vec<String> = vec![];
 
     let path_var = env::var("PATH")?;
-    let paths = path_var.split(":");
+    let paths = path_var.split(':');
     for path in paths {
         if let Ok(dir) = fs::read_dir(path) {
             for entry in dir {
@@ -276,12 +262,14 @@ fn build_path() -> Result<Vec<String>, Box<dyn Error>> {
                 let os_filename = entry.file_name();
                 let filename = os_filename.to_string_lossy().to_string();
                 if executables.contains(&filename) {
-                    break;
+                    continue;
                 }
                 let pathbuf = entry.path();
                 let metadata = fs::metadata(&pathbuf)?;
-                let mode = metadata.mode();
-                if metadata.is_file() && mode & 0o111 != 0 {
+                if !metadata.is_file() {
+                    continue;
+                }
+                if metadata.mode() & 0o111 != 0 {
                     executables.push(filename);
                 }
             }
@@ -291,8 +279,8 @@ fn build_path() -> Result<Vec<String>, Box<dyn Error>> {
     Ok(executables)
 }
 
-fn search(input: &String, executables: &Vec<String>, precise_wheight: f32) -> Vec<String> {
-    if input.len() == 0 {
+fn search(input: &String, executables: &[String], precise_wheight: f32) -> Vec<String> {
+    if input.is_empty() {
         return vec![];
     }
 
@@ -302,9 +290,9 @@ fn search(input: &String, executables: &Vec<String>, precise_wheight: f32) -> Ve
         .collect::<Vec<&str>>();
 
     let mut res: Vec<(&str, f32)> = fuzzy_search_best_n(input, &list, 20);
-    for i in 0..res.len() {
-        if let Some(start) = res[i].0.find(input) {
-            res[i].1 += (precise_wheight / (start as f32 + precise_wheight)) as f32;
+    for (entry, i) in &mut res {
+        if let Some(start) = entry.find(input) {
+            *i += (precise_wheight / (start as f32 + precise_wheight)) as f32;
         }
     }
     res.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -312,11 +300,9 @@ fn search(input: &String, executables: &Vec<String>, precise_wheight: f32) -> Ve
     return res.iter().map(|(s, _)| String::from(*s)).collect();
 }
 
-#[allow(dead_code)]
-fn pt() {
-    let start = SystemTime::now();
-    let since_the_epoch = start
-        .duration_since(UNIX_EPOCH)
-        .expect("Time went backwards");
-    println!("{:?}", since_the_epoch);
+fn spawn(output: String) -> Result<(), Box<dyn Error>> {
+    if let Err(err) = process::Command::new(output).spawn() {
+        eprintln!("Command error: {}", err);
+    }
+    Ok(())
 }
