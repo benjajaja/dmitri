@@ -1,11 +1,13 @@
 use breadx::{
-    auto::xproto::{InputFocus, SetInputFocusRequest, UngrabKeyRequest},
-    keysym_to_key,
+    display::{DisplayConnection, DisplayFunctionsExt},
     prelude::*,
-    DisplayConnection, Event, EventMask, KeyboardState, Window, WindowClass,
+    protocol::{
+        xproto::{self, EventMask, InputFocus, SetInputFocusRequest, UngrabKeyRequest},
+        Event,
+    },
 };
+use breadx_keysyms::{keysyms, KeyboardState};
 use getopts::Options;
-use gluten_keyboard::Key;
 use hex_color::HexColor;
 use rust_fuzzy_search::fuzzy_search_best_n;
 use std::{boxed::Box, env, error::Error, fs, os::unix::prelude::MetadataExt, process};
@@ -41,13 +43,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         fontname: matches.opt_str("f"),
         fontsize: matches
             .opt_str("s")
-            .and_then(|s| s.parse::<f32>().ok())
-            .unwrap_or(32.0),
-        color: matches
-            .opt_str("c")
-            .and_then(|s| s.parse::<HexColor>().ok())
-            .map(|h| (h.r, h.g, h.b))
-            .unwrap_or((255, 127, 0)),
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(32),
+        color: text::color_from_u8(
+            matches
+                .opt_str("c")
+                .and_then(|s| s.parse::<HexColor>().ok())
+                .map(|h| (h.r, h.g, h.b))
+                .unwrap_or((255, 127, 0)),
+        ),
         margin: matches
             .opt_str("m")
             .and_then(|s| s.parse::<u16>().ok())
@@ -58,48 +62,69 @@ fn main() -> Result<(), Box<dyn Error>> {
             .unwrap_or(5.0),
     };
 
-    let mut conn = DisplayConnection::create(None, None)?;
+    let mut conn = DisplayConnection::connect(None)?;
 
     let root = conn.default_screen().root;
-    let root_geometry = root.geometry_immediate(&mut conn)?;
+    //
+    // let cookie = conn.send_request(GetInputFocusRequest {
+    // ..Default::default()
+    // })?;
+    // let reply = conn.resolve_request(cookie)?;
+    // let focus_window = reply.focus;
+    //
+    // let screens = conn.screens().to_owned();
+    // 'out: for screen in screens {
+    // let tree = screen.root.query_tree_immediate(&mut conn)?;
+    // for child in tree.children.iter() {
+    // if *child == focus_window {
+    // println!("it is child");
+    // root = screen.root;
+    // break 'out;
+    // }
+    // }
+    // }
 
-    let params: WindowParameters = WindowParameters {
-        background_pixel: Some(conn.default_black_pixel()),
-        override_redirect: Some(1),
-        ..Default::default()
-    };
+    let root_geometry = conn.get_geometry_immediate(root)?;
 
-    let height = options.fontsize + (options.margin * 2) as f32;
-    let window = conn.create_window(
-        root,                        // parent
-        WindowClass::CopyFromParent, // window class
-        None,                        // depth (none means inherit from parent)
-        None,                        // visual (none means "       "    "    )
-        0,                           // x
-        0,
+    let height = options.fontsize + (options.margin * 2) as u16;
+
+    let wid = conn.generate_xid()?;
+    conn.create_window_checked(
+        0, // depth
+        wid,
+        root,                // parent
+        0,                   // x
+        0,                   // y
         root_geometry.width, // width
-        height as _,         // height
+        height,              // height
         0,                   // border width
-        params,              // additional properties
+        xproto::WindowClass::COPY_FROM_PARENT,
+        0, // visual
+        xproto::CreateWindowAux::new()
+            .background_pixel(conn.default_screen().black_pixel)
+            .override_redirect(1)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::KEY_PRESS
+                    | EventMask::KEY_RELEASE
+                    | EventMask::VISIBILITY_CHANGE
+                    | EventMask::FOCUS_CHANGE,
+            ),
     )?;
 
-    window.set_event_mask(
-        &mut conn,
-        EventMask::EXPOSURE
-            | EventMask::KEY_PRESS
-            | EventMask::VISIBILITY_CHANGE
-            | EventMask::FOCUS_CHANGE,
+    conn.map_window(wid)?;
+    // window.set_title(&mut conn, "Hello World!")?;
+
+    conn.send_void_request(
+        SetInputFocusRequest {
+            focus: wid,
+            revert_to: InputFocus::PARENT,
+            ..Default::default()
+        },
+        true,
     )?;
-    window.map(&mut conn)?;
-    window.set_title(&mut conn, "Hello World!")?;
 
-    conn.send_request(SetInputFocusRequest {
-        focus: window,
-        revert_to: InputFocus::Parent,
-        ..Default::default()
-    })?;
-
-    match run(&mut conn, window, root, options) {
+    match run(&mut conn, wid, root, options) {
         Err(err) => {
             eprintln!("Error: {}", err);
             Err(err)
@@ -113,30 +138,50 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn run<Dpy: Display + ?Sized>(
-    conn: &mut Dpy,
-    window: Window,
-    root: Window,
+fn run<Dpy: Display>(
+    connection: &mut Dpy,
+    wid: u32,
+    root: u32,
     options: RunOptions,
 ) -> Result<String, Box<dyn Error>> {
-    let gc = conn.create_gc(window, Default::default())?;
+    let gc = connection.generate_xid()?;
+    connection.create_gc_checked(
+        gc,
+        wid,
+        xproto::CreateGCAux::new()
+            .foreground(connection.default_screen().black_pixel)
+            .graphics_exposures(0)
+            .line_width(10),
+    )?;
 
-    // set up the exit protocol, this ensures the window exits when the "X"
-    // button is clicked
-    let wm_delete_window = conn.intern_atom_immediate("WM_DELETE_WINDOW".to_owned(), false)?;
-    window.set_wm_protocols(conn, &[wm_delete_window])?;
+    // set up an exit strategy
+    let wm_protocols = connection.intern_atom(false, "WM_PROTOCOLS")?;
+    let wm_delete_window = connection.intern_atom(false, "WM_DELETE_WINDOW")?;
+    connection.flush()?;
+    let wm_protocols = connection.wait_for_reply(wm_protocols)?.atom;
+    let wm_delete_window = connection.wait_for_reply(wm_delete_window)?.atom;
 
-    let keystate = KeyboardState::new(conn)?;
+    connection.change_property(
+        xproto::PropMode::REPLACE,
+        wid,
+        wm_protocols,
+        xproto::AtomEnum::ATOM.into(),
+        32,
+        1,
+        &wm_delete_window,
+    )?;
+
+    let mut keystate = KeyboardState::new(connection)?;
+    let mut is_shift = false;
 
     let mut input = String::new();
 
     let mut matches: Vec<String> = vec![];
     let mut matches_i: Option<usize> = None;
 
-    let geometry = window.geometry_immediate(conn)?;
+    let geometry = connection.get_geometry_immediate(wid)?;
     let mut font_render = FontRenderer::new(
-        conn,
-        window,
+        connection,
         geometry.depth,
         geometry.width as _,
         geometry.height as _,
@@ -146,7 +191,7 @@ fn run<Dpy: Display + ?Sized>(
     let executables = build_path()?;
 
     loop {
-        let ev = match conn.wait_for_event() {
+        let ev = match connection.wait_for_event() {
             Ok(ev) => ev,
             Err(e) => {
                 eprintln!("Program closed with error: {:?}", e);
@@ -156,92 +201,101 @@ fn run<Dpy: Display + ?Sized>(
 
         match ev {
             Event::ClientMessage(cme) => {
-                if cme.data.longs()[0] == wm_delete_window.xid {
+                if cme.data.as_data32()[0] == wm_delete_window {
                     process::exit(0);
                 }
             }
             Event::Expose(_) => {
-                font_render.render_text(conn, window, gc, &input, &matches, matches_i)?;
+                font_render.render_text(connection, wid, gc, &input, &matches, matches_i)?;
             }
             Event::FocusOut(_e) => {
-                conn.send_request(SetInputFocusRequest {
-                    focus: window,
-                    revert_to: InputFocus::Parent,
-                    ..Default::default()
-                })?;
+                connection.send_void_request(
+                    SetInputFocusRequest {
+                        focus: wid,
+                        revert_to: InputFocus::PARENT,
+                        ..Default::default()
+                    },
+                    true,
+                )?;
             }
             Event::KeyPress(kp) => {
-                let syms = keystate.lookup_keysyms(kp.detail);
-                let processed = if syms.is_empty() {
-                    None
-                } else {
-                    keysym_to_key(syms[0])
-                };
-                if let Some(keycode) = processed {
-                    match keycode {
-                        Key::Escape => {
-                            conn.send_request(UngrabKeyRequest {
+                let sym = keystate.symbol(connection, kp.detail, 0)?;
+                match sym {
+                    keysyms::KEY_Escape => {
+                        connection.send_void_request(
+                            UngrabKeyRequest {
                                 grab_window: root,
                                 ..Default::default()
-                            })?;
-                            window.unmap(conn)?;
-                            window.free(conn)?;
-                            return Ok("".to_string());
-                        }
-                        Key::Enter => {
-                            let output: String = match matches_i {
-                                None => input,
-                                Some(i) => matches.get(i).map(String::to_owned).unwrap_or(input),
-                            };
-                            return Ok(output);
-                        }
-                        Key::Tab => {
-                            if matches.len() > 1 {
-                                match matches_i {
-                                    None => {
-                                        if !kp.state.shift() {
-                                            matches_i = Some(0);
-                                        } else {
-                                            matches_i = Some(matches.len() - 1);
-                                        }
-                                    }
-                                    Some(i) => {
-                                        if !kp.state.shift() {
-                                            match matches.get(i + 1) {
-                                                Some(_) => matches_i = Some(i + 1),
-                                                None => matches_i = None,
-                                            }
-                                        } else if i > 0 && matches.get(i - 1).is_some() {
-                                            matches_i = Some(i - 1);
-                                        } else {
-                                            matches_i = None;
-                                        }
+                            },
+                            true,
+                        )?;
+                        connection.unmap_window(wid)?;
+                        // window.free(conn)?;
+                        return Ok(String::new());
+                    }
+                    keysyms::KEY_Return => {
+                        let output: String = match matches_i {
+                            None => input,
+                            Some(i) => matches.get(i).map(String::to_owned).unwrap_or(input),
+                        };
+                        return Ok(output);
+                    }
+                    keysyms::KEY_Tab => {
+                        if matches.len() > 1 {
+                            match matches_i {
+                                None => {
+                                    if !is_shift {
+                                        matches_i = Some(0);
+                                    } else {
+                                        matches_i = Some(matches.len() - 1);
                                     }
                                 }
-                            }
-                        }
-                        Key::Backspace => {
-                            if !input.is_empty() {
-                                input = input[0..input.len() - 1].to_string();
-                                matches_i = None;
-                                matches = search(&input, &executables, options.precise_wheight);
-                            }
-                        }
-                        _ => {
-                            if let Some(mut keycode_char) = keycode.as_char() {
-                                if !kp.state.shift() {
-                                    keycode_char = keycode_char
-                                        .to_lowercase()
-                                        .next()
-                                        .ok_or("lowercase keycode char")?;
+                                Some(i) => {
+                                    if !is_shift {
+                                        match matches.get(i + 1) {
+                                            Some(_) => matches_i = Some(i + 1),
+                                            None => matches_i = None,
+                                        }
+                                    } else if i > 0 && matches.get(i - 1).is_some() {
+                                        matches_i = Some(i - 1);
+                                    } else {
+                                        matches_i = None;
+                                    }
                                 }
-                                input.push(keycode_char);
-                                matches_i = None;
-                                matches = search(&input, &executables, options.precise_wheight);
                             }
                         }
                     }
-                    font_render.render_text(conn, window, gc, &input, &matches, matches_i)?;
+                    keysyms::KEY_BackSpace => {
+                        if !input.is_empty() {
+                            input = input[0..input.len() - 1].to_string();
+                            matches_i = None;
+                            matches = search(&input, &executables, options.precise_wheight);
+                        }
+                    }
+                    keysyms::KEY_Shift_L | keysyms::KEY_Shift_R => {
+                        is_shift = true;
+                    }
+                    k => {
+                        if let Some(mut keycode_char) = char::from_u32(k) {
+                            keycode_char = keycode_char
+                                .to_lowercase()
+                                .next()
+                                .ok_or("lowercase keycode char")?;
+                            input.push(keycode_char);
+                            matches_i = None;
+                            matches = search(&input, &executables, options.precise_wheight);
+                        }
+                    }
+                }
+                font_render.render_text(connection, wid, gc, &input, &matches, matches_i)?;
+            }
+            Event::KeyRelease(kr) => {
+                let sym = keystate.symbol(connection, kr.detail, 0)?;
+                match sym {
+                    keysyms::KEY_Shift_L | keysyms::KEY_Shift_R => {
+                        is_shift = false;
+                    }
+                    _ => (),
                 }
             }
             _ => (),
