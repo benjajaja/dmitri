@@ -154,6 +154,21 @@ fn run<Dpy: Display>(
             .line_width(10),
     )?;
 
+    let geometry = connection.get_geometry_immediate(wid)?;
+    let mut font_render = FontRenderer::new(
+        connection,
+        geometry.depth,
+        geometry.width as _,
+        geometry.height as _,
+        &options,
+    )?;
+    let mut input = String::new();
+
+    let mut matches: Vec<String> = vec![];
+    let mut matches_i: Option<usize> = None;
+
+    font_render.render_text(connection, wid, gc, "█", &matches, matches_i)?;
+
     // set up an exit strategy
     let wm_protocols = connection.intern_atom(false, "WM_PROTOCOLS")?;
     let wm_delete_window = connection.intern_atom(false, "WM_DELETE_WINDOW")?;
@@ -173,20 +188,6 @@ fn run<Dpy: Display>(
 
     let mut keystate = KeyboardState::new(connection)?;
     let mut is_shift = false;
-
-    let mut input = String::new();
-
-    let mut matches: Vec<String> = vec![];
-    let mut matches_i: Option<usize> = None;
-
-    let geometry = connection.get_geometry_immediate(wid)?;
-    let mut font_render = FontRenderer::new(
-        connection,
-        geometry.depth,
-        geometry.width as _,
-        geometry.height as _,
-        &options,
-    )?;
 
     let executables = build_path()?;
 
